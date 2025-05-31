@@ -86,6 +86,12 @@ with col2:
                 
                 st.session_state.streams.append(stream)
                 st.success("Stream scheduled successfully!")
+                
+                # Note about FFmpeg
+                try:
+                    subprocess.run(['ffmpeg', '-version'], check=True, capture_output=True)
+                except:
+                    st.warning("FFmpeg is not available. Streams will run in simulation mode.")
             else:
                 st.error("Please enter a YouTube Stream Key")
 
@@ -127,4 +133,6 @@ st.markdown("""
 3. Set the duration in HH:MM:SS format
 4. Enter your YouTube Stream Key
 5. Click 'Schedule Stream' to add it to the schedule
+
+Note: This app requires FFmpeg for actual streaming. Without FFmpeg, it will run in simulation mode.
 """)
