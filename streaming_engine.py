@@ -4,6 +4,7 @@ import os
 import threading
 import time
 from datetime import datetime
+import signal
 
 # Set up logging
 logging.basicConfig(
@@ -16,32 +17,24 @@ logger = logging.getLogger('streaming_engine')
 class RTMPStreamer:
     def __init__(self):
         self.active_streams = {}
-        try:
-            self.check_ffmpeg()
-        except RuntimeError as e:
-            logger.warning(f"FFmpeg check failed: {str(e)}")
-            # Continue without ffmpeg for UI testing
-            pass
+        self.ffmpeg_available = self.check_ffmpeg()
         
     def check_ffmpeg(self):
-        """Check if ffmpeg is available on the system"""
+        """Check if ffmpeg is available and return True if it is"""
         try:
             result = subprocess.run(['ffmpeg', '-version'], 
                                    stdout=subprocess.PIPE, 
                                    stderr=subprocess.PIPE, 
                                    text=True, 
-                                   check=False)
-            if result.returncode != 0:
-                logger.warning("ffmpeg is not installed or not in PATH")
-            else:
-                logger.info("ffmpeg found, version: " + result.stdout.split('\n')[0])
-        except FileNotFoundError:
-            logger.warning("ffmpeg is not installed or not in PATH")
+                                   check=True)
+            logger.info("FFmpeg found, version: " + result.stdout.split('\n')[0])
+            return True
+        except (subprocess.SubprocessError, FileNotFoundError) as e:
+            logger.error(f"FFmpeg check failed: {str(e)}")
+            return False
     
     def start_stream(self, stream_id, video_path, streaming_key, duration, on_complete=None):
-        """
-        Start streaming a video file to YouTube using RTMP protocol
-        """
+        """Start streaming a video file to YouTube using RTMP protocol"""
         if not os.path.exists(video_path):
             logger.error(f"Video file not found: {video_path}")
             return False
@@ -50,18 +43,23 @@ class RTMPStreamer:
             logger.warning(f"Stream {stream_id} is already active")
             return False
         
+        if not self.ffmpeg_available:
+            logger.error("FFmpeg is not available. Cannot start actual streaming.")
+            return False
+        
         thread = threading.Thread(
             target=self._stream_thread,
             args=(stream_id, video_path, streaming_key, duration, on_complete),
             daemon=True
         )
+        
         self.active_streams[stream_id] = {
             'thread': thread,
             'start_time': datetime.now(),
             'status': 'initializing',
-            'process': None,
-            'connection_verified': False
+            'process': None
         }
+        
         thread.start()
         return True
     
@@ -70,65 +68,84 @@ class RTMPStreamer:
         logger.info(f"Starting stream {stream_id} with video {video_path}")
         
         try:
-            # Simulate streaming for testing when ffmpeg is not available
-            try:
-                subprocess.run(['ffmpeg', '-version'], check=True, capture_output=True)
-                use_ffmpeg = True
-            except:
-                use_ffmpeg = False
-                logger.warning("FFmpeg not available, running in simulation mode")
+            rtmp_url = f"rtmp://a.rtmp.youtube.com/live2/{streaming_key}"
             
-            if use_ffmpeg:
-                rtmp_url = f"rtmp://a.rtmp.youtube.com/live2/{streaming_key}"
-                command = [
-                    'ffmpeg',
-                    '-re',
-                    '-i', video_path,
-                    '-c:v', 'libx264',
-                    '-preset', 'veryfast',
-                    '-maxrate', '3000k',
-                    '-bufsize', '6000k',
-                    '-pix_fmt', 'yuv420p',
-                    '-g', '50',
-                    '-c:a', 'aac',
-                    '-b:a', '160k',
-                    '-ac', '2',
-                    '-ar', '44100',
-                    '-f', 'flv',
-                    rtmp_url
-                ]
-                
-                process = subprocess.Popen(
-                    command,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    bufsize=1,
-                    universal_newlines=True
-                )
-                
+            # FFmpeg command with improved streaming parameters
+            command = [
+                'ffmpeg',
+                '-re',  # Read input at native frame rate
+                '-i', video_path,
+                '-c:v', 'libx264',  # Video codec
+                '-preset', 'veryfast',  # Encoding preset
+                '-tune', 'zerolatency',  # Tune for streaming
+                '-maxrate', '4500k',  # Maximum bitrate
+                '-bufsize', '9000k',  # Buffer size (2x maxrate)
+                '-pix_fmt', 'yuv420p',  # Pixel format
+                '-g', '60',  # Keyframe interval
+                '-c:a', 'aac',  # Audio codec
+                '-b:a', '160k',  # Audio bitrate
+                '-ac', '2',  # Audio channels
+                '-ar', '44100',  # Audio sample rate
+                '-f', 'flv',  # Output format
+                '-flvflags', 'no_duration_filesize',  # Important for live streaming
+                rtmp_url
+            ]
+            
+            # Update status to streaming
+            if stream_id in self.active_streams:
+                self.active_streams[stream_id]['status'] = 'connecting'
+            
+            # Start FFmpeg process
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=1,
+                universal_newlines=True
+            )
+            
+            if stream_id in self.active_streams:
+                self.active_streams[stream_id]['process'] = process
+                self.active_streams[stream_id]['status'] = 'streaming'
+            
+            # Monitor the process
+            start_time = time.time()
+            while process.poll() is None:
+                if time.time() - start_time >= duration:
+                    # Gracefully stop the stream
+                    self.stop_stream(stream_id)
+                    break
+                time.sleep(1)
+            
+            # Check process return code
+            if process.returncode == 0:
+                logger.info(f"Stream {stream_id} completed successfully")
                 if stream_id in self.active_streams:
-                    self.active_streams[stream_id]['process'] = process
-                    self.active_streams[stream_id]['status'] = 'streaming'
-                
-                process.wait()
-                
-                if process.returncode != 0:
-                    logger.error(f"Stream {stream_id} failed with return code {process.returncode}")
-                    self.active_streams[stream_id]['status'] = 'error'
+                    self.active_streams[stream_id]['status'] = 'completed'
             else:
-                # Simulation mode
-                self.active_streams[stream_id]['status'] = 'simulated'
-                time.sleep(duration)  # Simulate streaming duration
-                
+                logger.error(f"Stream {stream_id} failed with return code {process.returncode}")
+                if stream_id in self.active_streams:
+                    self.active_streams[stream_id]['status'] = 'error'
+            
         except Exception as e:
             logger.error(f"Error in stream thread: {str(e)}")
             if stream_id in self.active_streams:
                 self.active_streams[stream_id]['status'] = 'error'
         
         finally:
+            # Cleanup
             if stream_id in self.active_streams:
-                if self.active_streams[stream_id]['status'] not in ['error']:
-                    self.active_streams[stream_id]['status'] = 'completed'
+                process = self.active_streams[stream_id].get('process')
+                if process and process.poll() is None:
+                    try:
+                        os.kill(process.pid, signal.SIGTERM)
+                        process.wait(timeout=5)
+                    except:
+                        try:
+                            os.kill(process.pid, signal.SIGKILL)
+                        except:
+                            pass
+                
                 del self.active_streams[stream_id]
             
             if on_complete:
@@ -143,11 +160,15 @@ class RTMPStreamer:
             
             if process and process.poll() is None:
                 try:
-                    process.terminate()
+                    # Try graceful termination first
+                    os.kill(process.pid, signal.SIGTERM)
                     process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait()
+                except:
+                    try:
+                        # Force kill if graceful termination fails
+                        os.kill(process.pid, signal.SIGKILL)
+                    except:
+                        pass
             
             del self.active_streams[stream_id]
             return True
